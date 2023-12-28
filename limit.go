@@ -3,7 +3,10 @@ package main
 import (
 	"encoding/json"
 	"log"
+	"net"
 	"net/http"
+	"sync"
+	"time"
 
 	"golang.org/x/time/rate"
 )
@@ -26,10 +29,47 @@ func endpointHandler(writer http.ResponseWriter, request *http.Request) {
 	}
 }
 
-func rateLimiter(next func(w http.ResponseWriter, r *http.Request)) http.Handler {
-	limiter := rate.NewLimiter(2, 4)
+type Client struct {
+	limiter  *rate.Limiter
+	lastSeen time.Time
+}
+
+var (
+	mu      sync.Mutex
+	clients = make(map[string]*Client)
+)
+
+func perClientLimiter(next func(w http.ResponseWriter, r *http.Request)) http.Handler {
+
+	go func() {
+		for {
+			time.Sleep(time.Minute)
+			mu.Lock()
+			for ip, client := range clients {
+				if time.Since(client.lastSeen) > time.Minute*3 {
+					delete(clients, ip)
+				}
+			}
+			mu.Unlock()
+		}
+	}()
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !limiter.Allow() {
+		ip, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		mu.Lock()
+		if _, found := clients[ip]; !found {
+			clients[ip] = &Client{limiter: rate.NewLimiter(2, 4)}
+		}
+		clients[ip].lastSeen = time.Now()
+
+		if !clients[ip].limiter.Allow() {
+			mu.Unlock()
+
 			message := Message{
 				Status: "Request Failed",
 				Body:   "The API is at capacity, try again later.",
@@ -39,13 +79,15 @@ func rateLimiter(next func(w http.ResponseWriter, r *http.Request)) http.Handler
 			json.NewEncoder(w).Encode(&message)
 			return
 		} else {
+			mu.Unlock()
 			next(w, r)
 		}
 	})
 }
 
 func main() {
-	http.Handle("/ping", rateLimiter(endpointHandler))
+	print("Listening now\n")
+	http.Handle("/ping", perClientLimiter(endpointHandler))
 	err := http.ListenAndServe(":8080", nil)
 	if err != nil {
 		log.Println("There was an error listening on port :8080", err)
